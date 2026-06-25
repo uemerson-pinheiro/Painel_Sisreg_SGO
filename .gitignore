@@ -1,6 +1,8 @@
 # Automação local (contém credenciais do SISREG)
 sisreg_pendentes.py
+sisreg_pendentes_sgo.py
 sisreg_oferta.py
+sisreg_agendamentos.py
 requirements_sisreg.txt
 arquivos.bat
 
