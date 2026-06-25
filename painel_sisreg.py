@@ -632,13 +632,22 @@ def aba_agendamentos(df: pd.DataFrame) -> None:
     st.markdown("---")
     titulo_secao("DADOS DETALHADOS")
     if not df.empty:
+        filtro_nome_ag = st.text_input(
+            "Filtrar por nome do paciente",
+            key="filtro_nome_agendamentos",
+            placeholder="Digite parte do nome..."
+        )
         cols_exibir = [c for c in [
             "data_agendamento", "descricao_procedimento", "nome",
             "unidade_fantasia", "estabelecimento_executor",
             "nome_profissional_solicitante", "nome_profissional_executante",
             "situacao", "cid", "tipo_label"
         ] if c in df.columns]
-        df_det = df[cols_exibir].sort_values("data_agendamento", ascending=False).head(500).reset_index(drop=True)
+        df_det = df[cols_exibir].sort_values("data_agendamento", ascending=False).reset_index(drop=True)
+        if filtro_nome_ag and "nome" in df_det.columns:
+            df_det = df_det[df_det["nome"].str.upper().str.contains(
+                filtro_nome_ag.upper(), na=False)]
+        df_det = df_det.head(500).reset_index(drop=True)
         if "data_agendamento" in df_det.columns:
             df_det["data_agendamento"] = df_det["data_agendamento"].dt.strftime("%d/%m/%Y")
         st.dataframe(df_det, use_container_width=True, height=350)
@@ -702,6 +711,37 @@ def aba_demanda_reprimida(demanda: dict) -> None:
                                    margin=dict(t=10, b=10, l=10, r=70),
                                    plot_bgcolor="white", paper_bgcolor="white")
                 st.plotly_chart(fig2, use_container_width=True)
+
+            # Gráfico 3 — Por Unidade Solicitante (linha inteira)
+            titulo_secao("POR UNIDADE SOLICITANTE")
+            if "unidade_solicitante" in df.columns:
+                cnt_unid = df["unidade_solicitante"].value_counts().head(20).reset_index()
+                cnt_unid.columns = ["Unidade Solicitante", "Qtd"]
+                fig3 = px.bar(cnt_unid, x="Qtd", y="Unidade Solicitante", orientation="h",
+                              color_discrete_sequence=[cor], text="Qtd")
+                fig3.update_traces(textposition="outside")
+                fig3.update_layout(height=460, yaxis=dict(categoryorder="total ascending"),
+                                   margin=dict(t=10, b=10, l=10, r=70),
+                                   plot_bgcolor="white", paper_bgcolor="white")
+                st.plotly_chart(fig3, use_container_width=True)
+
+            # Gráfico 4 — Por Profissional Solicitante (linha inteira)
+            titulo_secao("POR PROFISSIONAL SOLICITANTE")
+            prof_col_sgo = next(
+                (c for c in df.columns if ("profissional" in c or "medico" in c) and "unidade" not in c),
+                None
+            )
+            if prof_col_sgo:
+                cnt_prof = df[prof_col_sgo].dropna().str.strip().value_counts().head(20).reset_index()
+                cnt_prof.columns = ["Profissional Solicitante", "Qtd"]
+                cnt_prof = cnt_prof[cnt_prof["Profissional Solicitante"] != ""]
+                fig4 = px.bar(cnt_prof, x="Qtd", y="Profissional Solicitante", orientation="h",
+                              color_discrete_sequence=[CORES["amarelo"]], text="Qtd")
+                fig4.update_traces(textposition="outside")
+                fig4.update_layout(height=460, yaxis=dict(categoryorder="total ascending"),
+                                   margin=dict(t=10, b=10, l=10, r=70),
+                                   plot_bgcolor="white", paper_bgcolor="white")
+                st.plotly_chart(fig4, use_container_width=True)
 
             # Tabela — filtro por nome do paciente
             titulo_secao("REGISTROS")
