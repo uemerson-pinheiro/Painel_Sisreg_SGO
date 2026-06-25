@@ -1,0 +1,21 @@
+# Automação local (contém credenciais do SISREG)
+sisreg_pendentes.py
+sisreg_oferta.py
+requirements_sisreg.txt
+arquivos.bat
+
+# Segredos locais (configurados no Streamlit Cloud Secrets)
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Arquivos avulsos
+fonte.txt
+script_painle.txt
+"EXTRATO - ESTABELECIMENTOS + LEITOS.csv"
+"palheta de cores SISREG.png"
+.claude/
