@@ -672,6 +672,16 @@ def aba_absenteismo(df: pd.DataFrame) -> None:
 
 
 def aba_agendamentos(df: pd.DataFrame) -> None:
+    total_ag     = len(df)
+    confirmados  = int(df.get("compareceu", pd.Series(dtype=bool)).sum()) if not df.empty else 0
+    pendentes    = int((df.get("situacao", pd.Series(dtype=str)) == "PENDENTE").sum()) if not df.empty else 0
+
+    c1, c2, c3 = st.columns(3)
+    with c1: kpi(fmt_br(total_ag),    "Total Agendamentos", "azul")
+    with c2: kpi(fmt_br(confirmados), "Confirmados",        "verde")
+    with c3: kpi(fmt_br(pendentes),   "Pendentes",          "amarelo")
+
+    st.markdown("<br>", unsafe_allow_html=True)
     titulo_secao("VOLUME DE AGENDAMENTOS")
 
     col1, col2 = st.columns(2)
