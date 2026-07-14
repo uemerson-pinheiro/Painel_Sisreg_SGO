@@ -575,6 +575,27 @@ def aba_absenteismo(df: pd.DataFrame) -> None:
             st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
+    titulo_secao("PENDENTES POR PROCEDIMENTO")
+
+    if not df.empty and "situacao" in df.columns and "descricao_procedimento" in df.columns:
+        df_pend_proc = df[df["situacao"] == "PENDENTE"]
+        if not df_pend_proc.empty:
+            cnt_proc = df_pend_proc["descricao_procedimento"].value_counts().head(20).reset_index()
+            cnt_proc.columns = ["Procedimento", "Qtd"]
+            fig_proc = px.bar(cnt_proc, x="Qtd", y="Procedimento", orientation="h",
+                              color_discrete_sequence=[CORES["vermelho"]], text="Qtd")
+            fig_proc.update_traces(textposition="outside")
+            fig_proc.update_layout(
+                height=500, yaxis=dict(categoryorder="total ascending"),
+                margin=dict(t=10, b=10, l=10, r=70),
+                xaxis=dict(range=[0, cnt_proc["Qtd"].max() * 1.18]),
+                plot_bgcolor="white", paper_bgcolor="white",
+            )
+            st.plotly_chart(fig_proc, use_container_width=True)
+        else:
+            st.info("Nenhum agendamento PENDENTE encontrado.")
+
+    st.markdown("---")
     titulo_secao("TEMPO AUTORIZAÇÃO → AGENDAMENTO  |  PENDENTES")
 
     tem_colunas = not df.empty and "data_autorizacao" in df.columns and "data_agendamento" in df.columns
