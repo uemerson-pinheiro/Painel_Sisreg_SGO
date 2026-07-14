@@ -650,7 +650,7 @@ def aba_absenteismo(df: pd.DataFrame) -> None:
 
             titulo_secao("REGISTROS PENDENTES — DETALHE")
             cols_tab = [c for c in [
-                "cod_solicitacao", "data_solicitacao", "unidade_fantasia", "descricao_procedimento",
+                "solicitacao", "data_solicitacao", "unidade_fantasia", "descricao_procedimento",
                 "data_autorizacao", "data_agendamento", "tempo_dias", "tipo_agend",
             ] if c in df_pend.columns]
             df_tab = df_pend[cols_tab].copy()
@@ -658,7 +658,7 @@ def aba_absenteismo(df: pd.DataFrame) -> None:
                 if col in df_tab.columns:
                     df_tab[col] = df_tab[col].dt.strftime("%d/%m/%Y")
             df_tab = df_tab.rename(columns={
-                "cod_solicitacao":        "Cód. Solicitação",
+                "solicitacao":            "Cód. Solicitação",
                 "data_solicitacao":       "Data Solicitação",
                 "unidade_fantasia":       "Unidade Solicitante",
                 "descricao_procedimento": "Procedimento",
