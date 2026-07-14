@@ -594,17 +594,14 @@ def aba_agendamentos(df: pd.DataFrame) -> None:
                 - df_pend["data_autorizacao"].dt.normalize()
             ).dt.days
 
-            # Tipo: EM TELA (data_solicitacao == data_agendamento) ou REGULADO
-            if "data_solicitacao" in df_pend.columns:
-                df_pend["tipo_agend"] = df_pend.apply(
-                    lambda r: "EM TELA"
-                    if pd.notna(r["data_solicitacao"]) and pd.notna(r["data_agendamento"])
-                    and r["data_solicitacao"].normalize() == r["data_agendamento"].normalize()
-                    else "REGULADO",
-                    axis=1,
-                )
-            else:
-                df_pend["tipo_agend"] = "REGULADO"
+            # Tipo: EM TELA (data_autorizacao == data_agendamento) ou REGULADO
+            df_pend["tipo_agend"] = df_pend.apply(
+                lambda r: "EM TELA"
+                if pd.notna(r["data_autorizacao"]) and pd.notna(r["data_agendamento"])
+                and r["data_autorizacao"].normalize() == r["data_agendamento"].normalize()
+                else "REGULADO",
+                axis=1,
+            )
 
             # Faixas de tempo
             ordem_faixas = ["≤ 7 dias", "8–15 dias", "16–30 dias", "31–45 dias", "46–60 dias", "> 60 dias"]
