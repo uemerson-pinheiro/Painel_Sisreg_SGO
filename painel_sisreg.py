@@ -593,8 +593,8 @@ def aba_absenteismo(df: pd.DataFrame) -> None:
 
             df_pend["tipo_agend"] = df_pend.apply(
                 lambda r: "EM TELA"
-                if pd.notna(r["data_autorizacao"]) and pd.notna(r["data_agendamento"])
-                and r["data_autorizacao"].normalize() == r["data_agendamento"].normalize()
+                if pd.notna(r["data_solicitacao"]) and pd.notna(r["data_autorizacao"])
+                and r["data_solicitacao"].normalize() == r["data_autorizacao"].normalize()
                 else "REGULADO",
                 axis=1,
             )
