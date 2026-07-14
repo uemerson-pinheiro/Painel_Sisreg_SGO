@@ -515,7 +515,7 @@ def aba_visao_geral(df: pd.DataFrame, demanda: dict, oferta: pd.DataFrame) -> No
         st.plotly_chart(fig, use_container_width=True)
 
 
-def aba_agendamentos(df: pd.DataFrame) -> None:
+def aba_absenteismo(df: pd.DataFrame) -> None:
     titulo_secao("ABSENTEÍSMO")
 
     passados = df[df.get("passado", pd.Series(dtype=bool))] if not df.empty else pd.DataFrame()
@@ -523,13 +523,11 @@ def aba_agendamentos(df: pd.DataFrame) -> None:
     total_passados = len(passados)
     taxa_geral = round(ausentes_total / total_passados * 100, 1) if total_passados > 0 else 0
 
-    # Gauge centralizado
     _, col_centro, _ = st.columns([1, 2, 1])
     with col_centro:
         fig = gauge_absenteismo(taxa_geral, "Absenteísmo Geral")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Dois gráficos lado a lado abaixo do gauge
     col_exec, col_sol = st.columns(2)
 
     with col_exec:
@@ -588,13 +586,11 @@ def aba_agendamentos(df: pd.DataFrame) -> None:
         if df_pend.empty:
             st.info("Nenhum agendamento PENDENTE encontrado.")
         else:
-            # Tempo em dias: agendamento - autorização
             df_pend["tempo_dias"] = (
                 df_pend["data_agendamento"].dt.normalize()
                 - df_pend["data_autorizacao"].dt.normalize()
             ).dt.days
 
-            # Tipo: EM TELA (data_autorizacao == data_agendamento) ou REGULADO
             df_pend["tipo_agend"] = df_pend.apply(
                 lambda r: "EM TELA"
                 if pd.notna(r["data_autorizacao"]) and pd.notna(r["data_agendamento"])
@@ -603,37 +599,32 @@ def aba_agendamentos(df: pd.DataFrame) -> None:
                 axis=1,
             )
 
-            # Faixas de tempo
             ordem_faixas = ["≤ 7 dias", "8–15 dias", "16–30 dias", "31–45 dias", "46–60 dias", "> 60 dias"]
 
             def _faixa(dias):
-                if pd.isna(dias) or dias < 0:
-                    return None
-                if dias <= 7:   return "≤ 7 dias"
-                if dias <= 15:  return "8–15 dias"
-                if dias <= 30:  return "16–30 dias"
-                if dias <= 45:  return "31–45 dias"
-                if dias <= 60:  return "46–60 dias"
+                if pd.isna(dias) or dias < 0: return None
+                if dias <= 7:  return "≤ 7 dias"
+                if dias <= 15: return "8–15 dias"
+                if dias <= 30: return "16–30 dias"
+                if dias <= 45: return "31–45 dias"
+                if dias <= 60: return "46–60 dias"
                 return "> 60 dias"
 
             df_pend["faixa_tempo"] = df_pend["tempo_dias"].apply(_faixa)
 
-            # KPIs rápidos
-            tot_reg   = int((df_pend["tipo_agend"] == "REGULADO").sum())
-            tot_tela  = int((df_pend["tipo_agend"] == "EM TELA").sum())
-            media_t   = df_pend["tempo_dias"].dropna()
+            tot_reg  = int((df_pend["tipo_agend"] == "REGULADO").sum())
+            tot_tela = int((df_pend["tipo_agend"] == "EM TELA").sum())
+            media_t  = df_pend["tempo_dias"].dropna()
             media_str = f"{int(media_t.mean())} dias" if not media_t.empty else "—"
             c1, c2, c3 = st.columns(3)
-            with c1: kpi(fmt_br(tot_reg),  "REGULADO",   "azul")
-            with c2: kpi(fmt_br(tot_tela), "EM TELA",    "verde")
+            with c1: kpi(fmt_br(tot_reg),  "REGULADO",        "azul")
+            with c2: kpi(fmt_br(tot_tela), "EM TELA",         "verde")
             with c3: kpi(media_str,         "Média de Espera", "amarelo")
 
-            # Gráfico — barras verticais empilhadas por faixa
             df_chart = (
                 df_pend.dropna(subset=["faixa_tempo"])
                 .groupby(["faixa_tempo", "tipo_agend"])
-                .size()
-                .reset_index(name="Qtd")
+                .size().reset_index(name="Qtd")
             )
             df_chart["faixa_tempo"] = pd.Categorical(
                 df_chart["faixa_tempo"], categories=ordem_faixas, ordered=True
@@ -657,7 +648,6 @@ def aba_agendamentos(df: pd.DataFrame) -> None:
             )
             st.plotly_chart(fig_t, use_container_width=True)
 
-            # Tabela detalhada
             titulo_secao("REGISTROS PENDENTES — DETALHE")
             cols_tab = [c for c in [
                 "data_solicitacao", "unidade_fantasia", "descricao_procedimento",
@@ -668,18 +658,19 @@ def aba_agendamentos(df: pd.DataFrame) -> None:
                 if col in df_tab.columns:
                     df_tab[col] = df_tab[col].dt.strftime("%d/%m/%Y")
             df_tab = df_tab.rename(columns={
-                "data_solicitacao":      "Data Solicitação",
-                "unidade_fantasia":      "Unidade Solicitante",
-                "descricao_procedimento":"Procedimento",
-                "data_autorizacao":      "Data Autorização",
-                "data_agendamento":      "Data Agendamento",
-                "tempo_dias":            "Tempo (dias)",
-                "tipo_agend":            "Tipo",
+                "data_solicitacao":       "Data Solicitação",
+                "unidade_fantasia":       "Unidade Solicitante",
+                "descricao_procedimento": "Procedimento",
+                "data_autorizacao":       "Data Autorização",
+                "data_agendamento":       "Data Agendamento",
+                "tempo_dias":             "Tempo (dias)",
+                "tipo_agend":             "Tipo",
             })
             df_tab = df_tab.sort_values("Tempo (dias)", ascending=False).reset_index(drop=True)
             st.dataframe(df_tab, use_container_width=True, height=380)
 
-    st.markdown("---")
+
+def aba_agendamentos(df: pd.DataFrame) -> None:
     titulo_secao("VOLUME DE AGENDAMENTOS")
 
     col1, col2 = st.columns(2)
@@ -1128,9 +1119,10 @@ def main() -> None:
     df_filtrado = aplicar_filtros(df_ag.copy(), filtros)
 
     # Tabs principais
-    t1, t2, t3, t4 = st.tabs([
+    t1, t2, t3, t4, t5 = st.tabs([
         "📊 Visão Geral",
         "📅 Agendamentos",
+        "🚫 Absenteísmo",
         "⏳ Demanda Reprimida",
         "🏥 Oferta de Vagas",
     ])
@@ -1140,8 +1132,10 @@ def main() -> None:
     with t2:
         aba_agendamentos(df_filtrado)
     with t3:
-        aba_demanda_reprimida(demanda)
+        aba_absenteismo(df_filtrado)
     with t4:
+        aba_demanda_reprimida(demanda)
+    with t5:
         aba_oferta(df_of)
 
 
