@@ -14,6 +14,7 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+.venv/
 
 # Arquivos avulsos
 fonte.txt

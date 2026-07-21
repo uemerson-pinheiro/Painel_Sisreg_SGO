@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import glob
+import base64
 from pathlib import Path
 from datetime import date, datetime
 
@@ -15,11 +16,20 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ─────────────────────────────────────────────
 # CONFIGURAÇÃO
 # ─────────────────────────────────────────────
 PASTA = Path(__file__).parent
+
+
+def _localizar_logo_secretaria() -> Path | None:
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        caminho = PASTA / "assets" / f"logo_secretaria{ext}"
+        if caminho.exists():
+            return caminho
+    return None
 
 CORES = {
     "verde":       "#00D000",
@@ -103,9 +113,27 @@ def carregar_agendamentos() -> pd.DataFrame:
     return df
 
 
+def _extrair_data_extracao(nome_arquivo: str) -> datetime | None:
+    """Extrai a data/hora de extração embutida no nome do arquivo exportado do SISREG."""
+    m = re.search(r"(\d{8})_(\d{6})", nome_arquivo)
+    if m:
+        try:
+            return datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y%m%d %H%M%S")
+        except ValueError:
+            pass
+    m = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", nome_arquivo)
+    if m:
+        try:
+            return datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H-%M-%S")
+        except ValueError:
+            pass
+    return None
+
+
 @st.cache_data(show_spinner="Carregando demanda reprimida...")
 def carregar_demanda_reprimida() -> dict[str, pd.DataFrame]:
     resultado: dict[str, pd.DataFrame] = {}
+    datas_extracao: dict[str, datetime] = {}
 
     def _ler_csv(caminho: str) -> pd.DataFrame:
         try:
@@ -125,6 +153,9 @@ def carregar_demanda_reprimida() -> dict[str, pd.DataFrame]:
                     df["dias_espera"] = pd.to_numeric(df[col], errors="coerce")
                     break
             resultado["CG"] = df
+            data_extr = _extrair_data_extracao(Path(arqs_cg[-1]).name)
+            if data_extr:
+                datas_extracao["CG"] = data_extr
         except Exception as e:
             st.warning(f"Erro ao carregar demanda CG: {e}")
 
@@ -155,9 +186,13 @@ def carregar_demanda_reprimida() -> dict[str, pd.DataFrame]:
                 datas = pd.to_datetime(df[data_sol], errors="coerce", format="mixed")
                 df["dias_espera"] = (pd.Timestamp("today").normalize() - datas.dt.normalize()).dt.days
             resultado["SGO"] = df
+            data_extr = _extrair_data_extracao(Path(arqs_sgo[-1]).name)
+            if data_extr:
+                datas_extracao["SGO"] = data_extr
         except Exception as e:
             st.warning(f"Erro ao carregar demanda SGO: {e}")
 
+    resultado["_datas_extracao"] = datas_extracao
     return resultado
 
 
@@ -515,7 +550,7 @@ def aba_visao_geral(df: pd.DataFrame, demanda: dict, oferta: pd.DataFrame) -> No
         st.plotly_chart(fig, use_container_width=True)
 
 
-def aba_agendamentos(df: pd.DataFrame) -> None:
+def aba_absenteismo(df: pd.DataFrame) -> None:
     titulo_secao("ABSENTEÍSMO")
 
     passados = df[df.get("passado", pd.Series(dtype=bool))] if not df.empty else pd.DataFrame()
@@ -523,13 +558,11 @@ def aba_agendamentos(df: pd.DataFrame) -> None:
     total_passados = len(passados)
     taxa_geral = round(ausentes_total / total_passados * 100, 1) if total_passados > 0 else 0
 
-    # Gauge centralizado
     _, col_centro, _ = st.columns([1, 2, 1])
     with col_centro:
         fig = gauge_absenteismo(taxa_geral, "Absenteísmo Geral")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Dois gráficos lado a lado abaixo do gauge
     col_exec, col_sol = st.columns(2)
 
     with col_exec:
@@ -577,6 +610,134 @@ def aba_agendamentos(df: pd.DataFrame) -> None:
             st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
+    titulo_secao("PENDENTES POR PROCEDIMENTO")
+
+    if not df.empty and "situacao" in df.columns and "descricao_procedimento" in df.columns:
+        df_pend_proc = df[df["situacao"] == "PENDENTE"]
+        if not df_pend_proc.empty:
+            cnt_proc = df_pend_proc["descricao_procedimento"].value_counts().head(20).reset_index()
+            cnt_proc.columns = ["Procedimento", "Qtd"]
+            fig_proc = px.bar(cnt_proc, x="Qtd", y="Procedimento", orientation="h",
+                              color_discrete_sequence=[CORES["vermelho"]], text="Qtd")
+            fig_proc.update_traces(textposition="outside")
+            fig_proc.update_layout(
+                height=500, yaxis=dict(categoryorder="total ascending"),
+                margin=dict(t=10, b=10, l=10, r=70),
+                xaxis=dict(range=[0, cnt_proc["Qtd"].max() * 1.18]),
+                plot_bgcolor="white", paper_bgcolor="white",
+            )
+            st.plotly_chart(fig_proc, use_container_width=True)
+        else:
+            st.info("Nenhum agendamento PENDENTE encontrado.")
+
+    st.markdown("---")
+    titulo_secao("TEMPO AUTORIZAÇÃO → AGENDAMENTO  |  PENDENTES")
+
+    tem_colunas = not df.empty and "data_autorizacao" in df.columns and "data_agendamento" in df.columns
+    if not tem_colunas:
+        st.info("Colunas de data_autorizacao ou data_agendamento não encontradas nos dados.")
+    else:
+        df_pend = df[df.get("situacao", pd.Series(dtype=str)) == "PENDENTE"].copy()
+
+        if df_pend.empty:
+            st.info("Nenhum agendamento PENDENTE encontrado.")
+        else:
+            df_pend["tempo_dias"] = (
+                df_pend["data_agendamento"].dt.normalize()
+                - df_pend["data_autorizacao"].dt.normalize()
+            ).dt.days
+
+            df_pend["tipo_agend"] = df_pend.apply(
+                lambda r: "EM TELA"
+                if pd.notna(r["data_solicitacao"]) and pd.notna(r["data_autorizacao"])
+                and r["data_solicitacao"].normalize() == r["data_autorizacao"].normalize()
+                else "REGULADO",
+                axis=1,
+            )
+
+            ordem_faixas = ["≤ 7 dias", "8–15 dias", "16–30 dias", "31–45 dias", "46–60 dias", "> 60 dias"]
+
+            def _faixa(dias):
+                if pd.isna(dias) or dias < 0: return None
+                if dias <= 7:  return "≤ 7 dias"
+                if dias <= 15: return "8–15 dias"
+                if dias <= 30: return "16–30 dias"
+                if dias <= 45: return "31–45 dias"
+                if dias <= 60: return "46–60 dias"
+                return "> 60 dias"
+
+            df_pend["faixa_tempo"] = df_pend["tempo_dias"].apply(_faixa)
+
+            tot_reg  = int((df_pend["tipo_agend"] == "REGULADO").sum())
+            tot_tela = int((df_pend["tipo_agend"] == "EM TELA").sum())
+            media_t  = df_pend["tempo_dias"].dropna()
+            media_str = f"{int(media_t.mean())} dias" if not media_t.empty else "—"
+            c1, c2, c3 = st.columns(3)
+            with c1: kpi(fmt_br(tot_reg),  "REGULADO",        "azul")
+            with c2: kpi(fmt_br(tot_tela), "EM TELA",         "verde")
+            with c3: kpi(media_str,         "Média de Espera", "amarelo")
+
+            df_chart = (
+                df_pend.dropna(subset=["faixa_tempo"])
+                .groupby(["faixa_tempo", "tipo_agend"])
+                .size().reset_index(name="Qtd")
+            )
+            df_chart["faixa_tempo"] = pd.Categorical(
+                df_chart["faixa_tempo"], categories=ordem_faixas, ordered=True
+            )
+            df_chart = df_chart.sort_values("faixa_tempo")
+
+            fig_t = px.bar(
+                df_chart, x="faixa_tempo", y="Qtd", color="tipo_agend",
+                barmode="stack",
+                color_discrete_map={"REGULADO": CORES["azul"], "EM TELA": CORES["verde"]},
+                labels={"faixa_tempo": "Tempo Autorização → Agendamento",
+                        "Qtd": "Solicitações", "tipo_agend": "Tipo"},
+                text="Qtd",
+            )
+            fig_t.update_traces(textposition="inside", textfont_size=11)
+            fig_t.update_layout(
+                height=380,
+                margin=dict(t=10, b=50, l=10, r=10),
+                legend=dict(orientation="h", y=-0.2, title_text=""),
+                plot_bgcolor="white", paper_bgcolor="white",
+            )
+            st.plotly_chart(fig_t, use_container_width=True)
+
+            titulo_secao("REGISTROS PENDENTES — DETALHE")
+            cols_tab = [c for c in [
+                "solicitacao", "data_solicitacao", "unidade_fantasia", "descricao_procedimento",
+                "data_autorizacao", "data_agendamento", "tempo_dias", "tipo_agend",
+            ] if c in df_pend.columns]
+            df_tab = df_pend[cols_tab].copy()
+            for col in ["data_solicitacao", "data_autorizacao", "data_agendamento"]:
+                if col in df_tab.columns:
+                    df_tab[col] = df_tab[col].dt.strftime("%d/%m/%Y")
+            df_tab = df_tab.rename(columns={
+                "solicitacao":            "Cód. Solicitação",
+                "data_solicitacao":       "Data Solicitação",
+                "unidade_fantasia":       "Unidade Solicitante",
+                "descricao_procedimento": "Procedimento",
+                "data_autorizacao":       "Data Autorização",
+                "data_agendamento":       "Data Agendamento",
+                "tempo_dias":             "Tempo (dias)",
+                "tipo_agend":             "Tipo",
+            })
+            df_tab = df_tab.sort_values("Tempo (dias)", ascending=False).reset_index(drop=True)
+            st.dataframe(df_tab, use_container_width=True, height=380)
+
+
+def aba_agendamentos(df: pd.DataFrame) -> None:
+    total_ag     = len(df)
+    confirmados  = int(df.get("compareceu", pd.Series(dtype=bool)).sum()) if not df.empty else 0
+    pendentes    = int((df.get("situacao", pd.Series(dtype=str)) == "PENDENTE").sum()) if not df.empty else 0
+
+    c1, c2, c3 = st.columns(3)
+    with c1: kpi(fmt_br(total_ag),    "Total Agendamentos", "azul")
+    with c2: kpi(fmt_br(confirmados), "Confirmados",        "verde")
+    with c3: kpi(fmt_br(pendentes),   "Pendentes",          "amarelo")
+
+    st.markdown("<br>", unsafe_allow_html=True)
     titulo_secao("VOLUME DE AGENDAMENTOS")
 
     col1, col2 = st.columns(2)
@@ -653,13 +814,254 @@ def aba_agendamentos(df: pd.DataFrame) -> None:
         st.dataframe(df_det, use_container_width=True, height=350)
 
 
+# ─────────────────────────────────────────────
+# RELATÓRIO — DEMANDA REPRIMIDA
+# ─────────────────────────────────────────────
+
+def _logo_secretaria_base64() -> str | None:
+    caminho = _localizar_logo_secretaria()
+    if caminho is None:
+        return None
+    mime = "image/png" if caminho.suffix.lower() == ".png" else "image/jpeg"
+    dados = base64.b64encode(caminho.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{dados}"
+
+
+def _top_procedimentos(df: pd.DataFrame, limite: int | None = 20) -> pd.DataFrame:
+    """Agrega por procedimento (Qtd + média de dias de espera). limite=None retorna todos."""
+    if df.empty or "procedimento" not in df.columns:
+        return pd.DataFrame(columns=["Procedimento", "Qtd", "Média Dias de Espera"])
+    agg = (df.groupby("procedimento")
+             .agg(Qtd=("procedimento", "size"), Media=("dias_espera", "mean"))
+             .reset_index()
+             .rename(columns={"procedimento": "Procedimento"}))
+    agg = agg.sort_values("Qtd", ascending=False)
+    if limite is not None:
+        agg = agg.head(limite)
+    agg["Media"] = agg["Media"].round(1)
+    agg = agg.rename(columns={"Media": "Média Dias de Espera"})
+    return agg.reset_index(drop=True)
+
+
+def _tabela_html(df: pd.DataFrame) -> str:
+    linhas = "".join(
+        f"<tr><td>{i+1}</td><td>{r['Procedimento']}</td><td>{fmt_br(r['Qtd'])}</td>"
+        f"<td>{'' if pd.isna(r['Média Dias de Espera']) else int(r['Média Dias de Espera'])}</td></tr>"
+        for i, r in df.iterrows()
+    )
+    if not linhas:
+        linhas = "<tr><td colspan='4'>Sem dados disponíveis.</td></tr>"
+    return f"""
+    <table class="tabela-relatorio">
+        <thead>
+            <tr><th>#</th><th>Procedimento</th><th>Qtd. na Fila</th><th>Média Dias de Espera</th></tr>
+        </thead>
+        <tbody>{linhas}</tbody>
+    </table>
+    """
+
+
+def gerar_relatorio_html(demanda: dict, limite: int | None = 20) -> str:
+    df_sgo = demanda.get("SGO", pd.DataFrame())
+    df_cg = demanda.get("CG", pd.DataFrame())
+    datas_extracao = demanda.get("_datas_extracao", {})
+
+    data_extr_sgo = (datas_extracao["SGO"].strftime("%d/%m/%Y às %H:%M")
+                      if "SGO" in datas_extracao else "não disponível")
+    data_extr_cg = (datas_extracao["CG"].strftime("%d/%m/%Y às %H:%M")
+                     if "CG" in datas_extracao else "não disponível")
+    data_impressao = datetime.now().strftime("%d/%m/%Y às %H:%M")
+
+    logo_uri = _logo_secretaria_base64()
+    logo_html = (f'<img src="{logo_uri}" class="logo-secretaria" alt="Secretaria de Saúde">'
+                 if logo_uri else '<div class="logo-ausente">Logo da Secretaria não encontrada</div>')
+
+    top_sgo = _top_procedimentos(df_sgo, limite)
+    top_cg = _top_procedimentos(df_cg, limite)
+    titulo_ranking = f"TOP {limite} PROCEDIMENTOS" if limite is not None else "TODOS OS PROCEDIMENTOS"
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+    <meta charset="UTF-8">
+    <title>Relatório de Demanda Reprimida</title>
+    <style>
+        @page {{ size: A4; margin: 16mm 14mm; }}
+        * {{ box-sizing: border-box; }}
+        body {{
+            font-family: Arial, Helvetica, sans-serif;
+            color: #222;
+            margin: 0;
+            padding: 0 8px;
+        }}
+.cabecalho {{
+            margin-bottom: 14px;
+        }}
+        .cabecalho .brasao {{
+            text-align: center;
+            margin-bottom: 8px;
+        }}
+        .logo-secretaria {{ max-width: 100%; height: auto; max-height: 90px; }}
+        .logo-ausente {{
+            font-size: 10px; color: #999; border: 1px dashed #ccc;
+            padding: 8px; width: 100%; text-align: center;
+        }}
+        .cabecalho .sub-cabecalho {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            border-top: 1px solid #ddd;
+            border-bottom: 3px solid #183EFF;
+            padding: 8px 0;
+        }}
+        .sus-badge {{
+            display: flex; align-items: center; gap: 6px;
+            flex-shrink: 0;
+        }}
+        .titulo-relatorio {{
+            text-align: center;
+            flex-grow: 1;
+        }}
+        .titulo-relatorio h1 {{
+            font-size: 18px;
+            margin: 0;
+            color: #183EFF;
+            letter-spacing: 1px;
+        }}
+        .titulo-relatorio p {{
+            font-size: 11px;
+            margin: 2px 0 0 0;
+            color: #555;
+        }}
+        .info-impressao {{
+            font-size: 10px;
+            color: #555;
+            text-align: right;
+            margin-bottom: 16px;
+            line-height: 1.5;
+        }}
+        .cards {{
+            display: flex;
+            gap: 14px;
+            margin-bottom: 18px;
+        }}
+        .card {{
+            flex: 1;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            padding: 10px 14px;
+            text-align: center;
+        }}
+        .card .valor {{ font-size: 26px; font-weight: bold; color: #183EFF; }}
+        .card .label {{ font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }}
+        .sec-relatorio {{
+            font-size: 13px;
+            font-weight: bold;
+            color: #fff;
+            background: #183EFF;
+            padding: 5px 10px;
+            border-radius: 4px;
+            margin: 18px 0 8px 0;
+        }}
+        table.tabela-relatorio {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+        }}
+        table.tabela-relatorio thead {{
+            display: table-header-group;
+        }}
+        table.tabela-relatorio tr {{
+            break-inside: avoid;
+        }}
+        table.tabela-relatorio th, table.tabela-relatorio td {{
+            border: 1px solid #ddd;
+            padding: 4px 6px;
+            text-align: left;
+        }}
+        table.tabela-relatorio th {{
+            background: #F0F2F6;
+        }}
+        table.tabela-relatorio td:nth-child(1),
+        table.tabela-relatorio td:nth-child(3),
+        table.tabela-relatorio td:nth-child(4) {{
+            text-align: center;
+            width: 90px;
+        }}
+        .rodape {{
+            margin-top: 24px;
+            font-size: 9px;
+            color: #999;
+            text-align: center;
+        }}
+        @media print {{
+            .sem-impressao {{ display: none !important; }}
+            .sec-relatorio {{ break-after: avoid; break-inside: avoid; }}
+        }}
+    </style>
+    </head>
+    <body>
+        <div class="cabecalho">
+            <div class="brasao">{logo_html}</div>
+            <div class="sub-cabecalho">
+                <div class="sus-badge">
+                    <svg width="48" height="48" viewBox="0 0 56 56" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="28" cy="28" r="27" fill="#005BAA"/>
+                        <text x="28" y="24" font-family="Arial, sans-serif" font-size="13" font-weight="bold"
+                              fill="#FFFFFF" text-anchor="middle">SUS</text>
+                        <text x="28" y="36" font-family="Arial, sans-serif" font-size="5.5"
+                              fill="#FFFFFF" text-anchor="middle">SISTEMA ÚNICO</text>
+                        <text x="28" y="43" font-family="Arial, sans-serif" font-size="5.5"
+                              fill="#FFFFFF" text-anchor="middle">DE SAÚDE</text>
+                    </svg>
+                </div>
+                <div class="titulo-relatorio">
+                    <h1>RELATÓRIO DE DEMANDA REPRIMIDA</h1>
+                    <p>Secretaria Municipal de Saúde — São Gabriel do Oeste/MS · Regulação Ambulatorial (SISREG)</p>
+                </div>
+                <div style="width:48px;"></div>
+            </div>
+        </div>
+
+        <div class="info-impressao">
+            Impresso em: {data_impressao}<br>
+            Dados extraídos em — Fila SGO: {data_extr_sgo} · Fila CG: {data_extr_cg}
+        </div>
+
+        <div class="cards">
+            <div class="card"><div class="valor">{fmt_br(len(df_sgo))}</div><div class="label">Demanda Reprimida SGO</div></div>
+            <div class="card"><div class="valor">{fmt_br(len(df_cg))}</div><div class="label">Demanda Reprimida CG</div></div>
+        </div>
+
+        <div class="sec-relatorio">{titulo_ranking} — FILA SGO (São Gabriel do Oeste)</div>
+        {_tabela_html(top_sgo)}
+
+        <div class="sec-relatorio">{titulo_ranking} — FILA CG (Campo Grande)</div>
+        {_tabela_html(top_cg)}
+
+        <div class="rodape">Relatório gerado automaticamente pelo Painel SISREG · São Gabriel do Oeste/MS</div>
+    </body>
+    </html>
+    """
+
+
 def aba_demanda_reprimida(demanda: dict) -> None:
-    st.markdown("""
+    datas_extracao = demanda.get("_datas_extracao", {})
+    partes_data = []
+    if "SGO" in datas_extracao:
+        partes_data.append(f"Fila SGO em {datas_extracao['SGO'].strftime('%d/%m/%Y às %H:%M')}")
+    if "CG" in datas_extracao:
+        partes_data.append(f"Fila CG em {datas_extracao['CG'].strftime('%d/%m/%Y às %H:%M')}")
+    texto_data = " · ".join(partes_data) if partes_data else "data de extração indisponível"
+
+    st.markdown(f"""
     <div style='background:#FFF8E1; border-left:5px solid #FFD000;
                 padding:0.8rem 1rem; border-radius:6px; margin-bottom:1rem;'>
         <b>⚠️ Atenção:</b> As filas CG (Campo Grande) e SGO (São Gabriel do Oeste) são independentes.
-        Pacientes podem estar em ambas as filas para procedimentos distintos ou semelhantes.
-        Não some os totais entre as filas.
+        Pacientes podem estar em ambas as filas para procedimentos distintos ou semelhantes.<br>
+        <b>ℹ️ Informações atualizadas em:</b> {texto_data}
     </div>
     """, unsafe_allow_html=True)
 
@@ -877,6 +1279,50 @@ def aba_demanda_reprimida(demanda: dict) -> None:
                              use_container_width=True, height=300)
 
 
+def aba_relatorio(demanda: dict) -> None:
+    st.markdown("""
+    <div style='background:#EEF3FF; border-left:5px solid #183EFF;
+                padding:0.8rem 1rem; border-radius:6px; margin-bottom:1rem;'>
+        Gere um relatório consolidado da Demanda Reprimida (filas SGO e CG), pronto para impressão,
+        com os procedimentos de maior demanda de cada fila e o tempo médio de espera.
+    </div>
+    """, unsafe_allow_html=True)
+
+    opcoes_qtd = {"10 mais": 10, "20 mais": 20, "30 mais": 30, "Todos": None}
+    col_filtro, col_btn, _ = st.columns([1.2, 1, 3])
+    with col_filtro:
+        escolha = st.selectbox("Procedimentos reprimidos", list(opcoes_qtd.keys()), index=1)
+    limite = opcoes_qtd[escolha]
+    with col_btn:
+        st.markdown("<div style='height:1.85rem;'></div>", unsafe_allow_html=True)
+        gerar = st.button("📄 Gerar Relatório", use_container_width=True)
+    if gerar:
+        st.session_state["mostrar_relatorio_demanda"] = True
+
+    if st.session_state.get("mostrar_relatorio_demanda"):
+        relatorio_html = gerar_relatorio_html(demanda, limite)
+        st.download_button(
+            "⬇️ Baixar Relatório (HTML) para impressão",
+            data=relatorio_html,
+            file_name=f"relatorio_demanda_reprimida_{datetime.now():%Y%m%d_%H%M}.html",
+            mime="text/html",
+        )
+        st.caption("Abra o arquivo baixado no navegador e use Ctrl+P (ou Cmd+P) para imprimir/gerar PDF.")
+        components.html(
+            relatorio_html + """
+            <div class="sem-impressao" style="text-align:center; margin-top:12px;">
+                <button onclick="window.print()"
+                        style="background:#183EFF;color:#fff;border:none;padding:8px 18px;
+                               border-radius:6px;font-size:13px;cursor:pointer;">
+                    🖨️ Imprimir
+                </button>
+            </div>
+            """,
+            height=850,
+            scrolling=True,
+        )
+
+
 def aba_oferta(oferta: pd.DataFrame) -> None:
     if oferta.empty:
         st.info("Dados de oferta de vagas não disponíveis.")
@@ -1025,11 +1471,13 @@ def main() -> None:
     df_filtrado = aplicar_filtros(df_ag.copy(), filtros)
 
     # Tabs principais
-    t1, t2, t3, t4 = st.tabs([
+    t1, t2, t3, t4, t5, t6 = st.tabs([
         "📊 Visão Geral",
         "📅 Agendamentos",
+        "🚫 Absenteísmo",
         "⏳ Demanda Reprimida",
         "🏥 Oferta de Vagas",
+        "📄 Relatório",
     ])
 
     with t1:
@@ -1037,9 +1485,13 @@ def main() -> None:
     with t2:
         aba_agendamentos(df_filtrado)
     with t3:
-        aba_demanda_reprimida(demanda)
+        aba_absenteismo(df_filtrado)
     with t4:
+        aba_demanda_reprimida(demanda)
+    with t5:
         aba_oferta(df_of)
+    with t6:
+        aba_relatorio(demanda)
 
 
 if __name__ == "__main__":
