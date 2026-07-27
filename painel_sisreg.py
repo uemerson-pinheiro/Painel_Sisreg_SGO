@@ -17,6 +17,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
+from fpdf import FPDF
 
 # ─────────────────────────────────────────────
 # CONFIGURAÇÃO
@@ -45,6 +46,12 @@ SEQ_CORES = [
     CORES["azul"], CORES["verde"], CORES["amarelo"],
     CORES["vermelho"], CORES["cinza"], "#8B5CF6", "#06B6D4", "#F97316",
 ]
+
+# Faixas de referência do Relatório Gestor (Oferta x Demanda)
+LIMITE_ESPERA_MIN = 30       # dias — abaixo disso: possível excesso de oferta
+LIMITE_ESPERA_MAX = 60       # dias — acima disso: déficit de oferta
+LIMITE_ABSENTEISMO_ALTO = 30    # % — reforça sinal de excesso quando espera é curta
+LIMITE_ABSENTEISMO_BAIXO = 15   # % — reforça que a fila é demanda real quando espera é longa
 
 MESES_PT = {
     1: "janeiro", 2: "fevereiro", 3: "marco",     4: "abril",
@@ -1279,56 +1286,444 @@ def aba_demanda_reprimida(demanda: dict) -> None:
                              use_container_width=True, height=300)
 
 
-def aba_relatorio(demanda: dict) -> None:
-    st.markdown("""
-    <div style='background:#EEF3FF; border-left:5px solid #183EFF;
-                padding:0.8rem 1rem; border-radius:6px; margin-bottom:1rem;'>
-        Gere um relatório consolidado da Demanda Reprimida (filas SGO e CG), pronto para impressão,
-        com os procedimentos de maior demanda de cada fila e o tempo médio de espera.
-    </div>
-    """, unsafe_allow_html=True)
+# ─────────────────────────────────────────────
+# RELATÓRIO GESTOR — OFERTA x DEMANDA
+# ─────────────────────────────────────────────
 
-    opcoes_qtd = {"10 mais": 10, "20 mais": 20, "30 mais": 30, "Todos": None}
-    col_filtro, col_btn, _ = st.columns([1.2, 1, 3])
-    with col_filtro:
-        escolha = st.selectbox("Procedimentos reprimidos", list(opcoes_qtd.keys()), index=1)
-    limite = opcoes_qtd[escolha]
-    with col_btn:
-        st.markdown("<div style='height:1.85rem;'></div>", unsafe_allow_html=True)
-        gerar = st.button("📄 Gerar Relatório", use_container_width=True)
-    if gerar:
-        st.session_state["mostrar_relatorio_demanda"] = True
+def _analise_oferta_demanda(oferta: pd.DataFrame, demanda: dict, df_ag: pd.DataFrame) -> pd.DataFrame:
+    """Cruza oferta ativa, fila de espera (SGO) e absenteísmo por procedimento."""
+    # Agrupamento sempre por chave já normalizada (evita duplicar linhas quando a mesma
+    # base tem variações de grafia/caixa do mesmo procedimento).
+    col_proc         = next((c for c in oferta.columns if "DESC. PROC" in c.upper()), None) if not oferta.empty else None
+    col_oferta_ativa = next((c for c in oferta.columns if "OFERTA ATIVA GERAL" in c.upper()), None) if not oferta.empty else None
 
-    if st.session_state.get("mostrar_relatorio_demanda"):
-        relatorio_html = gerar_relatorio_html(demanda, limite)
-        st.download_button(
-            "⬇️ Baixar Relatório (HTML) para impressão",
-            data=relatorio_html,
-            file_name=f"relatorio_demanda_reprimida_{datetime.now():%Y%m%d_%H%M}.html",
-            mime="text/html",
-        )
-        st.caption("Abra o arquivo baixado no navegador e use Ctrl+P (ou Cmd+P) para imprimir/gerar PDF.")
-        components.html(
-            relatorio_html + """
-            <div class="sem-impressao" style="text-align:center; margin-top:12px;">
-                <button onclick="window.print()"
-                        style="background:#183EFF;color:#fff;border:none;padding:8px 18px;
-                               border-radius:6px;font-size:13px;cursor:pointer;">
-                    🖨️ Imprimir
-                </button>
-            </div>
-            """,
-            height=850,
-            scrolling=True,
-        )
+    if col_proc and col_oferta_ativa:
+        tmp = oferta[[col_proc, col_oferta_ativa]].copy()
+        # carregar_oferta() força encoding="latin-1"; alguns CSVs de Oferta são na verdade
+        # UTF-8, o que corrompe acentos no nome do procedimento e quebraria o cruzamento
+        # por chave com a fila SGO (lida corretamente) se não for normalizado aqui.
+        tmp[col_proc] = tmp[col_proc].map(_pdf_safe)
+        tmp["_chave"] = tmp[col_proc].astype(str).str.upper().str.strip()
+        base = (tmp.groupby("_chave")
+                .agg(procedimento=(col_proc, "first"), oferta_ativa=(col_oferta_ativa, "sum"))
+                .reset_index())
+    else:
+        base = pd.DataFrame(columns=["_chave", "procedimento", "oferta_ativa"])
+
+    df_sgo = demanda.get("SGO") if demanda else None
+    if df_sgo is not None and not df_sgo.empty and "procedimento" in df_sgo.columns:
+        tmp = df_sgo.copy()
+        tmp["procedimento"] = tmp["procedimento"].map(_pdf_safe)
+        tmp["_chave"] = tmp["procedimento"].astype(str).str.upper().str.strip()
+        cols_agg = {"procedimento_fila": ("procedimento", "first"), "fila": ("procedimento", "size")}
+        if "estim_de_atendimento_do_procedimento" in tmp.columns:
+            cols_agg["tempo_estimado"] = ("estim_de_atendimento_do_procedimento", "mean")
+        if "dias_espera" in tmp.columns:
+            cols_agg["tempo_ja_aguardando"] = ("dias_espera", "mean")
+        fila = tmp.groupby("_chave").agg(**cols_agg).reset_index()
+    else:
+        fila = pd.DataFrame(columns=["_chave", "procedimento_fila", "fila", "tempo_estimado", "tempo_ja_aguardando"])
+
+    analise = base.merge(fila, on="_chave", how="outer")
+    if "procedimento_fila" in analise.columns:
+        analise["procedimento"] = analise["procedimento"].fillna(analise["procedimento_fila"])
+        analise = analise.drop(columns="procedimento_fila")
+
+    if df_ag is not None and not df_ag.empty \
+            and "descricao_procedimento" in df_ag.columns and "passado" in df_ag.columns:
+        pas = df_ag[df_ag["passado"] == True].copy()  # noqa: E712
+        pas["_chave"] = pas["descricao_procedimento"].map(_pdf_safe).str.upper().str.strip()
+        absent = (pas.groupby("_chave")
+                  .agg(total=("ausente", "count"), ausentes=("ausente", "sum"))
+                  .reset_index())
+        absent["absenteismo_pct"] = (absent["ausentes"] / absent["total"] * 100).round(1)
+        analise = analise.merge(absent[["_chave", "absenteismo_pct"]], on="_chave", how="left")
+    else:
+        analise["absenteismo_pct"] = pd.NA
+
+    for col in ["fila", "tempo_estimado", "tempo_ja_aguardando", "oferta_ativa", "absenteismo_pct"]:
+        if col not in analise.columns:
+            analise[col] = pd.NA
+    analise["fila"] = analise["fila"].fillna(0).astype(int)
+    analise["oferta_ativa"] = analise["oferta_ativa"].fillna(0)
+
+    def _classificar(tempo):
+        if pd.isna(tempo) or tempo < LIMITE_ESPERA_MIN:
+            return "Possível Excesso"
+        if tempo <= LIMITE_ESPERA_MAX:
+            return "Adequado"
+        return "Déficit"
+
+    analise["classificacao"] = analise["tempo_estimado"].apply(_classificar)
+    analise = analise.dropna(subset=["procedimento"])
+    analise = analise.sort_values("tempo_estimado", ascending=False, na_position="last").reset_index(drop=True)
+
+    return analise.reindex(columns=[
+        "procedimento", "fila", "tempo_estimado", "tempo_ja_aguardando",
+        "oferta_ativa", "absenteismo_pct", "classificacao",
+    ])
 
 
-def aba_oferta(oferta: pd.DataFrame) -> None:
+_SUBSTITUICOES_PDF = {
+    "–": "-", "—": "-", "‘": "'", "’": "'",
+    "“": '"', "”": '"', "…": "...", "•": "-",
+}
+
+
+def _pdf_safe(texto) -> str:
+    """Normaliza um texto para o conjunto de caracteres Latin-1 usado pelas fontes core do fpdf2.
+    Alguns CSVs de Oferta exportados pelo SISREG estão em UTF-8 mas são lidos como latin-1
+    (carregar_oferta), o que gera texto ilegível ("mojibake") em nomes de procedimento com
+    acento; o encode/decode abaixo desfaz essa leitura incorreta quando possível."""
+    texto = str(texto)
+    try:
+        texto = texto.encode("latin-1").decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+    for orig, novo in _SUBSTITUICOES_PDF.items():
+        texto = texto.replace(orig, novo)
+    resultado = []
+    for c in texto:
+        cp = ord(c)
+        if cp < 32 and c not in "\t\n":
+            continue
+        resultado.append("?" if cp > 255 or 128 <= cp <= 159 else c)
+    return "".join(resultado)
+
+
+def _texto_recomendacao(row: pd.Series) -> str:
+    """Frase de análise gestora para um procedimento (texto Latin-1: sem emojis/travessão)."""
+    proc      = _pdf_safe(row["procedimento"])
+    fila      = int(row["fila"]) if pd.notna(row["fila"]) else 0
+    tempo     = row["tempo_estimado"]
+    oferta    = row["oferta_ativa"]
+    absent    = row["absenteismo_pct"]
+    classif   = row["classificacao"]
+
+    tempo_txt  = f"{int(round(tempo))} dias" if pd.notna(tempo) else "não estimado (sem fila registrada)"
+    absent_txt = f"{absent:.1f}%" if pd.notna(absent) else "não disponível"
+
+    if classif == "Déficit":
+        texto = (f"{proc}: fila de {fmt_br(fila)} paciente(s) aguardando, com tempo médio estimado de "
+                 f"{tempo_txt} para atendimento - acima do limite de referência de {LIMITE_ESPERA_MAX} dias. "
+                 f"Oferta ativa atual: {fmt_br(int(oferta))} vaga(s). ")
+        if pd.notna(absent) and absent <= LIMITE_ABSENTEISMO_BAIXO:
+            texto += (f"O absenteísmo deste procedimento é baixo ({absent_txt}), o que reforça que a fila "
+                      "reflete demanda real, e não desperdício por faltas. ")
+        texto += "Recomenda-se avaliar a ampliação/contratação de vagas para este procedimento."
+        return texto
+
+    if classif == "Adequado":
+        return (f"{proc}: tempo médio estimado de {tempo_txt}, dentro da faixa considerada adequada "
+                f"({LIMITE_ESPERA_MIN}-{LIMITE_ESPERA_MAX} dias), com fila de {fmt_br(fila)} paciente(s) e "
+                f"absenteísmo de {absent_txt}. Oferta compatível com a demanda; recomenda-se apenas "
+                "monitoramento periódico.")
+
+    texto = f"{proc}: tempo médio estimado de {tempo_txt}"
+    if pd.notna(tempo):
+        texto += f", abaixo do limite mínimo de referência ({LIMITE_ESPERA_MIN} dias)"
+    texto += (f". Fila atual de {fmt_br(fila)} paciente(s), oferta ativa de {fmt_br(int(oferta))} vaga(s). ")
+    if pd.notna(absent) and absent >= LIMITE_ABSENTEISMO_ALTO:
+        texto += (f"O absenteísmo deste procedimento é elevado ({absent_txt}) - pacientes com acesso muito "
+                  "rápido tendem a faltar por saberem que conseguirão reagendar facilmente, o que reforça o "
+                  "sinal de oferta acima da necessidade. ")
+    texto += ("Recomenda-se avaliar a redução ou realocação de parte das vagas ativas deste procedimento para "
+              "especialidades em déficit, otimizando recursos sem prejuízo à qualidade assistencial.")
+    return texto
+
+
+def _fmt_pdf(v, casas: int = 0) -> str:
+    if pd.isna(v):
+        return "-"
+    if casas == 0:
+        return fmt_br(int(round(v)))
+    return f"{v:.{casas}f}"
+
+
+def _titulo_secao_pdf(pdf: FPDF, texto: str, cor: tuple[int, int, int]) -> None:
+    pdf.set_fill_color(*cor)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("helvetica", "B", 11)
+    pdf.cell(0, 8, texto, fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(40, 40, 40)
+    pdf.ln(1)
+
+
+def _tabela_bucket_pdf(pdf: FPDF, bucket_df: pd.DataFrame) -> None:
+    if bucket_df.empty:
+        pdf.set_font("helvetica", "I", 9)
+        pdf.cell(0, 6, "Nenhum procedimento nesta categoria.", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(2)
+        return
+    pdf.set_font("helvetica", "", 8)
+    pdf.set_fill_color(255, 255, 255)  # evita herdar a cor da barra de título da seção (vermelho/amarelo/azul)
+    pdf.set_text_color(40, 40, 40)
+    with pdf.table(col_widths=(38, 12, 15, 13, 15),
+                   text_align=("LEFT", "CENTER", "CENTER", "CENTER", "CENTER"),
+                   line_height=5) as table:
+        row = table.row()
+        for h in ["Procedimento", "Fila", "Tempo Est. (d)", "Of. Ativa", "Absent. (%)"]:
+            row.cell(h)
+        for _, r in bucket_df.iterrows():
+            row = table.row()
+            row.cell(_pdf_safe(r["procedimento"]))
+            row.cell(fmt_br(int(r["fila"])))
+            row.cell(_fmt_pdf(r["tempo_estimado"]))
+            row.cell(fmt_br(int(r["oferta_ativa"])))
+            row.cell(_fmt_pdf(r["absenteismo_pct"], 1))
+    pdf.ln(2)
+
+
+def _narrativa_bucket_pdf(pdf: FPDF, bucket_df: pd.DataFrame, limite: int | None) -> None:
+    destaque = bucket_df if limite is None else bucket_df.head(limite)
+    if destaque.empty:
+        return
+    pdf.set_font("helvetica", "B", 9)
+    pdf.cell(0, 6, "Análise:", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("helvetica", "", 8.5)
+    for _, r in destaque.iterrows():
+        pdf.multi_cell(0, 4.5, "- " + _texto_recomendacao(r), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+
+def gerar_relatorio_gestor_pdf(df_analise: pd.DataFrame, limite: int | None = 10) -> bytes:
+    AZUL, VERDE, AMARELO, VERMELHO, CINZA = (
+        (24, 62, 255), (0, 208, 0), (200, 152, 0), (255, 0, 0), (85, 85, 85)
+    )
+
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=16)
+    pdf.add_page()
+
+    logo_path = _localizar_logo_secretaria()
+    if logo_path is not None:
+        try:
+            pdf.image(str(logo_path), x=85, y=10, w=40)
+            pdf.set_y(34)
+        except Exception:
+            pdf.set_y(12)
+    else:
+        pdf.set_y(12)
+
+    pdf.set_font("helvetica", "B", 16)
+    pdf.set_text_color(*AZUL)
+    pdf.cell(0, 8, "RELATÓRIO GESTOR - OFERTA x DEMANDA", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("helvetica", "", 10)
+    pdf.set_text_color(*CINZA)
+    pdf.cell(0, 6, "Secretaria Municipal de Saúde - São Gabriel do Oeste/MS - Regulação Ambulatorial (SISREG)",
+             align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Gerado em {datetime.now():%d/%m/%Y %H:%M}", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    pdf.set_font("helvetica", "B", 11)
+    pdf.set_text_color(*AZUL)
+    pdf.cell(0, 7, "METODOLOGIA", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("helvetica", "", 9)
+    pdf.set_text_color(40, 40, 40)
+    pdf.multi_cell(0, 5,
+        f"Cada procedimento é classificado pelo tempo médio estimado de espera até o atendimento "
+        f"(estimativa do próprio SISREG, que já considera a oferta ativa de vagas): acima de "
+        f"{LIMITE_ESPERA_MAX} dias indica déficit de oferta (avaliar ampliação); entre {LIMITE_ESPERA_MIN} e "
+        f"{LIMITE_ESPERA_MAX} dias indica oferta adequada; abaixo de {LIMITE_ESPERA_MIN} dias indica possível "
+        f"excesso de oferta (avaliar redução/realocação de vagas). O absenteísmo do procedimento é usado como "
+        f"fator de reforço: espera curta com absenteísmo alto (>= {LIMITE_ABSENTEISMO_ALTO}%) reforça o sinal "
+        f"de excesso; espera longa com absenteísmo baixo (<= {LIMITE_ABSENTEISMO_BAIXO}%) reforça que a fila "
+        f"reflete demanda real, e não desperdício por faltas.",
+        new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+    total        = len(df_analise)
+    n_deficit    = int((df_analise["classificacao"] == "Déficit").sum())
+    n_adequado   = int((df_analise["classificacao"] == "Adequado").sum())
+    n_excesso    = int((df_analise["classificacao"] == "Possível Excesso").sum())
+    absent_medio = df_analise["absenteismo_pct"].mean()
+    absent_txt   = f"{absent_medio:.1f}%" if pd.notna(absent_medio) else "N/D"
+
+    kpis = [
+        ("Procedimentos", fmt_br(total)),
+        ("Déficit", fmt_br(n_deficit)),
+        ("Adequados", fmt_br(n_adequado)),
+        ("Poss. Excesso", fmt_br(n_excesso)),
+        ("Absent. Médio", absent_txt),
+    ]
+    pdf.set_font("helvetica", "", 9)
+    pdf.set_fill_color(255, 255, 255)
+    pdf.set_text_color(40, 40, 40)
+    with pdf.table(col_widths=(1, 1, 1, 1, 1), text_align="CENTER", line_height=6) as table:
+        row = table.row()
+        for label, _ in kpis:
+            row.cell(label)
+        row = table.row()
+        for _, valor in kpis:
+            row.cell(valor)
+    pdf.ln(4)
+
+    deficit = df_analise[df_analise["classificacao"] == "Déficit"] \
+        .sort_values("tempo_estimado", ascending=False)
+    adequado = df_analise[df_analise["classificacao"] == "Adequado"] \
+        .sort_values("tempo_estimado", ascending=False)
+    excesso = df_analise[df_analise["classificacao"] == "Possível Excesso"] \
+        .sort_values(["absenteismo_pct", "tempo_estimado"], ascending=[False, True], na_position="last")
+
+    pdf.add_page()
+    _titulo_secao_pdf(pdf, f"DÉFICIT DE OFERTA (ESPERA > {LIMITE_ESPERA_MAX} DIAS) - PRIORIDADE DE EXPANSÃO", VERMELHO)
+    _tabela_bucket_pdf(pdf, deficit)
+    _narrativa_bucket_pdf(pdf, deficit, limite)
+
+    pdf.add_page()
+    _titulo_secao_pdf(pdf, f"FAIXA ADEQUADA ({LIMITE_ESPERA_MIN}-{LIMITE_ESPERA_MAX} DIAS)", AMARELO)
+    _tabela_bucket_pdf(pdf, adequado)
+    pdf.set_font("helvetica", "I", 8.5)
+    pdf.multi_cell(0, 5, f"{len(adequado)} procedimento(s) dentro da faixa considerada adequada de espera. "
+                          "Recomenda-se apenas monitoramento periódico.",
+                   new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    pdf.add_page()
+    _titulo_secao_pdf(pdf, f"POSSÍVEL EXCESSO DE OFERTA (ESPERA < {LIMITE_ESPERA_MIN} DIAS) - OPORTUNIDADE DE OTIMIZAÇÃO", AZUL)
+    _tabela_bucket_pdf(pdf, excesso)
+    _narrativa_bucket_pdf(pdf, excesso, limite)
+
+    return bytes(pdf.output())
+
+
+def aba_relatorio(demanda: dict, oferta: pd.DataFrame, df_ag: pd.DataFrame) -> None:
+    sub1, sub2 = st.tabs(["📋 Demanda Reprimida", "📈 Análise Gestora — Oferta x Demanda"])
+
+    with sub1:
+        st.markdown("""
+        <div style='background:#EEF3FF; border-left:5px solid #183EFF;
+                    padding:0.8rem 1rem; border-radius:6px; margin-bottom:1rem;'>
+            Gere um relatório consolidado da Demanda Reprimida (filas SGO e CG), pronto para impressão,
+            com os procedimentos de maior demanda de cada fila e o tempo médio de espera.
+        </div>
+        """, unsafe_allow_html=True)
+
+        opcoes_qtd = {"10 mais": 10, "20 mais": 20, "30 mais": 30, "Todos": None}
+        col_filtro, col_btn, _ = st.columns([1.2, 1, 3])
+        with col_filtro:
+            escolha = st.selectbox("Procedimentos reprimidos", list(opcoes_qtd.keys()), index=1)
+        limite = opcoes_qtd[escolha]
+        with col_btn:
+            st.markdown("<div style='height:1.85rem;'></div>", unsafe_allow_html=True)
+            gerar = st.button("📄 Gerar Relatório", use_container_width=True)
+        if gerar:
+            st.session_state["mostrar_relatorio_demanda"] = True
+
+        if st.session_state.get("mostrar_relatorio_demanda"):
+            relatorio_html = gerar_relatorio_html(demanda, limite)
+            st.download_button(
+                "⬇️ Baixar Relatório (HTML) para impressão",
+                data=relatorio_html,
+                file_name=f"relatorio_demanda_reprimida_{datetime.now():%Y%m%d_%H%M}.html",
+                mime="text/html",
+            )
+            st.caption("Abra o arquivo baixado no navegador e use Ctrl+P (ou Cmd+P) para imprimir/gerar PDF.")
+            components.html(
+                relatorio_html + """
+                <div class="sem-impressao" style="text-align:center; margin-top:12px;">
+                    <button onclick="window.print()"
+                            style="background:#183EFF;color:#fff;border:none;padding:8px 18px;
+                                   border-radius:6px;font-size:13px;cursor:pointer;">
+                        🖨️ Imprimir
+                    </button>
+                </div>
+                """,
+                height=850,
+                scrolling=True,
+            )
+
+    with sub2:
+        st.markdown(f"""
+        <div style='background:#EEF3FF; border-left:5px solid #183EFF;
+                    padding:0.8rem 1rem; border-radius:6px; margin-bottom:1rem;'>
+            Cruza <b>oferta ativa de vagas</b>, <b>fila de espera</b> e <b>absenteísmo</b> por procedimento
+            para apoiar decisões de otimização de recursos. Critério: tempo médio estimado de espera
+            <b>acima de {LIMITE_ESPERA_MAX} dias</b> indica déficit de oferta (avaliar ampliação);
+            <b>entre {LIMITE_ESPERA_MIN} e {LIMITE_ESPERA_MAX} dias</b> indica oferta adequada;
+            <b>abaixo de {LIMITE_ESPERA_MIN} dias</b> indica possível excesso de oferta
+            (avaliar redução/realocação), reforçado pelo absenteísmo do procedimento.
+        </div>
+        """, unsafe_allow_html=True)
+
+        opcoes_destaque = {"5 mais": 5, "10 mais": 10, "20 mais": 20, "Todos": None}
+        col_filtro2, col_btn2, _ = st.columns([1.2, 1, 3])
+        with col_filtro2:
+            escolha2 = st.selectbox("Procedimentos em destaque por seção", list(opcoes_destaque.keys()), index=1)
+        limite2 = opcoes_destaque[escolha2]
+        with col_btn2:
+            st.markdown("<div style='height:1.85rem;'></div>", unsafe_allow_html=True)
+            gerar2 = st.button("📈 Gerar Relatório Gestor", use_container_width=True)
+        if gerar2:
+            st.session_state["mostrar_relatorio_gestor"] = True
+
+        if st.session_state.get("mostrar_relatorio_gestor"):
+            df_analise = _analise_oferta_demanda(oferta, demanda, df_ag)
+
+            if df_analise.empty:
+                st.info("Sem dados de oferta/demanda suficientes para montar a análise.")
+            else:
+                total        = len(df_analise)
+                n_deficit    = int((df_analise["classificacao"] == "Déficit").sum())
+                n_adequado   = int((df_analise["classificacao"] == "Adequado").sum())
+                n_excesso    = int((df_analise["classificacao"] == "Possível Excesso").sum())
+                absent_medio = df_analise["absenteismo_pct"].mean()
+
+                c1, c2, c3, c4, c5 = st.columns(5)
+                with c1: kpi(fmt_br(total), "Procedimentos", "azul")
+                with c2: kpi(fmt_br(n_deficit), "Déficit", "vermelho")
+                with c3: kpi(fmt_br(n_adequado), "Adequados", "amarelo")
+                with c4: kpi(fmt_br(n_excesso), "Possível Excesso", "azul")
+                with c5: kpi(f"{absent_medio:.1f}%" if pd.notna(absent_medio) else "—", "Absenteísmo Médio", "azul")
+
+                deficit = df_analise[df_analise["classificacao"] == "Déficit"] \
+                    .sort_values("tempo_estimado", ascending=False)
+                adequado = df_analise[df_analise["classificacao"] == "Adequado"] \
+                    .sort_values("tempo_estimado", ascending=False)
+                excesso = df_analise[df_analise["classificacao"] == "Possível Excesso"] \
+                    .sort_values(["absenteismo_pct", "tempo_estimado"], ascending=[False, True], na_position="last")
+
+                for titulo, bucket in [
+                    (f"DÉFICIT DE OFERTA (ESPERA > {LIMITE_ESPERA_MAX} DIAS)", deficit),
+                    (f"FAIXA ADEQUADA ({LIMITE_ESPERA_MIN}-{LIMITE_ESPERA_MAX} DIAS)", adequado),
+                    (f"POSSÍVEL EXCESSO DE OFERTA (ESPERA < {LIMITE_ESPERA_MIN} DIAS)", excesso),
+                ]:
+                    titulo_secao(titulo)
+                    if bucket.empty:
+                        st.info("Nenhum procedimento nesta categoria.")
+                        continue
+                    tabela = bucket.rename(columns={
+                        "procedimento": "Procedimento", "fila": "Fila",
+                        "tempo_estimado": "Tempo Estimado (dias)",
+                        "tempo_ja_aguardando": "Já Aguardando (dias)",
+                        "oferta_ativa": "Oferta Ativa", "absenteismo_pct": "Absenteísmo (%)",
+                    }).drop(columns="classificacao")
+                    st.dataframe(tabela.reset_index(drop=True), use_container_width=True, height=250)
+
+                    destaque = bucket if limite2 is None else bucket.head(limite2)
+                    if titulo.startswith("FAIXA ADEQUADA"):
+                        st.caption(f"{len(bucket)} procedimento(s) dentro da faixa adequada — "
+                                   "recomenda-se apenas monitoramento periódico.")
+                    else:
+                        for _, r in destaque.iterrows():
+                            st.markdown(f"- {_texto_recomendacao(r)}")
+
+                st.markdown("---")
+                pdf_bytes = gerar_relatorio_gestor_pdf(df_analise, limite2)
+                st.download_button(
+                    "⬇️ Baixar Relatório Gestor (PDF)",
+                    data=pdf_bytes,
+                    file_name=f"relatorio_gestor_oferta_demanda_{datetime.now():%Y%m%d_%H%M}.pdf",
+                    mime="application/pdf",
+                )
+
+
+def aba_oferta(oferta: pd.DataFrame, df_ag: pd.DataFrame | None = None,
+                demanda: dict | None = None) -> None:
     if oferta.empty:
         st.info("Dados de oferta de vagas não disponíveis.")
         return
 
-    # KPIs gerais
     col_oferta_ativa = next((c for c in oferta.columns if "OFERTA ATIVA GERAL" in c.upper()), None)
     col_oferta_total = next((c for c in oferta.columns if "OFERTA TOTAL GERAL" in c.upper()), None)
     col_bloqueada    = next((c for c in oferta.columns if "BLOQUEADA GERAL" in c.upper()), None)
@@ -1336,18 +1731,7 @@ def aba_oferta(oferta: pd.DataFrame) -> None:
     col_proc         = next((c for c in oferta.columns if "DESC. PROC" in c.upper()), None)
     col_estab        = next((c for c in oferta.columns if "DESC. ESTAB" in c.upper()), None)
 
-    total_ativa    = int(oferta[col_oferta_ativa].sum()) if col_oferta_ativa else 0
-    total_total    = int(oferta[col_oferta_total].sum()) if col_oferta_total else 0
-    total_bloq     = int(oferta[col_bloqueada].sum())    if col_bloqueada else 0
-    pct_bloqueada  = round(total_bloq / total_total * 100, 1) if total_total > 0 else 0
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1: kpi(fmt_br(total_total), "Oferta Total", "azul")
-    with c2: kpi(fmt_br(total_ativa), "Oferta Ativa", "verde")
-    with c3: kpi(fmt_br(total_bloq), "Oferta Bloqueada", "vermelho")
-    with c4: kpi(f"{pct_bloqueada}%", "% Bloqueada", "vermelho" if pct_bloqueada > 30 else "amarelo")
-
-    # Filtro competência
+    # Filtro competência (aplicado antes dos KPIs para que tudo na aba respeite a seleção)
     if "mes_competencia" in oferta.columns and "ano_competencia" in oferta.columns:
         competencias = sorted(
             oferta.dropna(subset=["ano_competencia", "mes_competencia"])
@@ -1358,6 +1742,22 @@ def aba_oferta(oferta: pd.DataFrame) -> None:
         if sel_comp != "Todas":
             m, a = sel_comp.split("/")
             oferta = oferta[(oferta["mes_competencia"] == int(m)) & (oferta["ano_competencia"] == int(a))]
+
+    if oferta.empty:
+        st.info("Nenhum dado de oferta para o período selecionado.")
+        return
+
+    # KPIs gerais (calculados após o filtro de competência/sidebar)
+    total_ativa    = int(oferta[col_oferta_ativa].sum()) if col_oferta_ativa else 0
+    total_total    = int(oferta[col_oferta_total].sum()) if col_oferta_total else 0
+    total_bloq     = int(oferta[col_bloqueada].sum())    if col_bloqueada else 0
+    pct_bloqueada  = round(total_bloq / total_total * 100, 1) if total_total > 0 else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: kpi(fmt_br(total_total), "Oferta Total", "azul")
+    with c2: kpi(fmt_br(total_ativa), "Oferta Ativa", "verde")
+    with c3: kpi(fmt_br(total_bloq), "Oferta Bloqueada", "vermelho")
+    with c4: kpi(f"{pct_bloqueada}%", "% Bloqueada", "vermelho" if pct_bloqueada > 30 else "amarelo")
 
     col1, col2 = st.columns(2)
 
@@ -1371,10 +1771,11 @@ def aba_oferta(oferta: pd.DataFrame) -> None:
                         marker_color=CORES["verde"])
             fig.add_bar(x=grp[col_proc], y=grp[col_bloqueada], name="Bloqueada",
                         marker_color=CORES["vermelho"])
-            fig.update_layout(barmode="stack", height=420,
+            fig.update_layout(barmode="stack", height=460,
                               xaxis_tickangle=-35,
-                              legend=dict(orientation="h", y=-0.35),
-                              margin=dict(t=10, b=80, l=10, r=10),
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                          xanchor="right", x=1),
+                              margin=dict(t=40, b=140, l=10, r=10),
                               plot_bgcolor="white", paper_bgcolor="white")
             st.plotly_chart(fig, use_container_width=True)
 
@@ -1395,6 +1796,48 @@ def aba_oferta(oferta: pd.DataFrame) -> None:
                               margin=dict(t=10, b=10, l=10, r=60),
                               plot_bgcolor="white", paper_bgcolor="white")
             st.plotly_chart(fig, use_container_width=True)
+
+    titulo_secao("PROFISSIONAIS, VAGAS E TEMPO DE ESPERA — POR PROCEDIMENTO")
+    if col_proc:
+        if col_oferta_ativa:
+            base = oferta.groupby(col_proc)[col_oferta_ativa].sum().reset_index()
+            base = base.rename(columns={col_proc: "procedimento", col_oferta_ativa: "total_vagas"})
+        else:
+            base = oferta[[col_proc]].drop_duplicates().rename(columns={col_proc: "procedimento"})
+            base["total_vagas"] = pd.NA
+        base["_chave"] = base["procedimento"].astype(str).str.upper().str.strip()
+
+        if df_ag is not None and not df_ag.empty \
+                and "descricao_procedimento" in df_ag.columns \
+                and "nome_profissional_executante" in df_ag.columns:
+            prof = (df_ag.dropna(subset=["nome_profissional_executante"])
+                    .groupby("descricao_procedimento")["nome_profissional_executante"]
+                    .nunique().reset_index(name="qtd_profissionais"))
+            prof["_chave"] = prof["descricao_procedimento"].astype(str).str.upper().str.strip()
+            base = base.merge(prof[["_chave", "qtd_profissionais"]], on="_chave", how="left")
+        else:
+            base["qtd_profissionais"] = pd.NA
+
+        df_sgo = demanda.get("SGO") if demanda else None
+        if df_sgo is not None and not df_sgo.empty \
+                and "procedimento" in df_sgo.columns \
+                and "estim_de_atendimento_do_procedimento" in df_sgo.columns:
+            espera = (df_sgo.groupby("procedimento")["estim_de_atendimento_do_procedimento"]
+                      .mean().round(0).reset_index(name="tempo_medio_espera_dias"))
+            espera["_chave"] = espera["procedimento"].astype(str).str.upper().str.strip()
+            base = base.merge(espera[["_chave", "tempo_medio_espera_dias"]], on="_chave", how="left")
+        else:
+            base["tempo_medio_espera_dias"] = pd.NA
+
+        base = base.drop(columns="_chave").sort_values("total_vagas", ascending=False, na_position="last")
+        base["qtd_profissionais"] = base["qtd_profissionais"].fillna(0).astype(int)
+        base = base.rename(columns={
+            "procedimento": "Procedimento",
+            "qtd_profissionais": "Qtd. Profissionais",
+            "total_vagas": "Total de Vagas (Oferta Ativa)",
+            "tempo_medio_espera_dias": "Tempo Médio de Espera (dias)",
+        })
+        st.dataframe(base.reset_index(drop=True), use_container_width=True, height=400)
 
     titulo_secao("DADOS COMPLETOS — OFERTA")
     col_exib = [c for c in [col_proc, col_estab, "mes_competencia", "ano_competencia",
@@ -1470,6 +1913,13 @@ def main() -> None:
     filtros = sidebar_filtros(df_ag)
     df_filtrado = aplicar_filtros(df_ag.copy(), filtros)
 
+    df_of_filtrado = df_of.copy()
+    if filtros["ano"] != "Todos" and "ano_competencia" in df_of_filtrado.columns:
+        df_of_filtrado = df_of_filtrado[df_of_filtrado["ano_competencia"] == int(filtros["ano"])]
+    if filtros["mes"] != "Todos" and "mes_competencia" in df_of_filtrado.columns:
+        mes_num = MESES_NUM.get(filtros["mes"].lower(), 0)
+        df_of_filtrado = df_of_filtrado[df_of_filtrado["mes_competencia"] == mes_num]
+
     # Tabs principais
     t1, t2, t3, t4, t5, t6 = st.tabs([
         "📊 Visão Geral",
@@ -1481,7 +1931,7 @@ def main() -> None:
     ])
 
     with t1:
-        aba_visao_geral(df_filtrado, demanda, df_of)
+        aba_visao_geral(df_filtrado, demanda, df_of_filtrado)
     with t2:
         aba_agendamentos(df_filtrado)
     with t3:
@@ -1489,9 +1939,9 @@ def main() -> None:
     with t4:
         aba_demanda_reprimida(demanda)
     with t5:
-        aba_oferta(df_of)
+        aba_oferta(df_of_filtrado, df_filtrado, demanda)
     with t6:
-        aba_relatorio(demanda)
+        aba_relatorio(demanda, df_of_filtrado, df_filtrado)
 
 
 if __name__ == "__main__":
